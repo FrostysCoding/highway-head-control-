@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Head-Controlled Highway — Endless Runner Prototype</title>
+  <style>
+    body { margin:0; padding:0; width:100vw; height:100vh; overflow:hidden; background:#0a0e16; }
+    .container { position:relative; width:100%; height:100%; overflow:hidden; }
+    #webcam { position:absolute; left:14px; bottom:14px; width:240px; height:180px; object-fit:cover;
+      border-radius:10px; transform:scaleX(-1); z-index:8; box-shadow:0 6px 20px rgba(0,0,0,0.55);
+      border:1px solid rgba(143,255,207,0.4); }
+    #overlay { position:absolute; left:14px; bottom:14px; width:240px; height:180px;
+      transform:scaleX(-1); z-index:9; pointer-events:none; }
+    #pipcap { position:absolute; left:14px; bottom:198px; color:#8fffcf; font-family:ui-monospace,monospace;
+      font-size:11px; background:rgba(0,0,0,0.5); padding:3px 7px; border-radius:6px; z-index:9; }
+    #reticle { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+      z-index:7; pointer-events:none; transition:opacity 0.2s; }
+    #three-canvas { position:absolute; inset:0; z-index:1; }
+    #flash { position:absolute; inset:0; z-index:6; pointer-events:none; opacity:0;
+      background:radial-gradient(ellipse at center, rgba(255,60,60,0.12) 0%, rgba(255,40,40,0.55) 100%);
+      transition:opacity 0.18s; }
+    #status { position:absolute; top:14px; left:14px; color:#dfe7ff; background:rgba(0,0,0,0.5);
+      padding:8px 12px; border-radius:8px; font-family:system-ui,Arial,sans-serif; font-size:13px; z-index:10; max-width:360px; line-height:1.4; }
+    #hud { position:absolute; top:14px; right:14px; color:#8fffcf; background:rgba(0,0,0,0.5);
+      padding:8px 12px; border-radius:8px; font-family:ui-monospace,monospace; font-size:13px; z-index:10; white-space:pre; text-align:right; }
+    #score { position:absolute; top:12%; left:50%; transform:translateX(-50%);
+      color:#fff; font-family:ui-monospace,monospace; font-size:34px; letter-spacing:2px; z-index:7;
+      text-shadow:0 2px 14px rgba(0,0,0,0.9); pointer-events:none; text-align:center; }
+    #score small { display:block; font-size:12px; letter-spacing:1px; opacity:0.7; margin-top:4px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <video id="webcam" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div id="pipcap">head detection · nose tip = control point</div>
+    <div id="three-canvas"></div>
+    <div id="flash"></div>
+    <div id="reticle">
+      <svg width="52" height="52" viewBox="0 0 52 52">
+        <circle cx="26" cy="26" r="22" fill="none" stroke="#8fffcf" stroke-width="2"/>
+        <line x1="26" y1="4"  x2="26" y2="17" stroke="#8fffcf" stroke-width="2"/>
+        <line x1="26" y1="35" x2="26" y2="48" stroke="#8fffcf" stroke-width="2"/>
+        <line x1="4"  y1="26" x2="17" y2="26" stroke="#8fffcf" stroke-width="2"/>
+        <line x1="35" y1="26" x2="48" y2="26" stroke="#8fffcf" stroke-width="2"/>
+        <circle cx="26" cy="26" r="3" fill="#8fffcf"/>
+      </svg>
+    </div>
+    <div id="score">0 m<small>best 0 m</small></div>
+    <div id="status">Loading…</div>
+    <div id="hud"></div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver }
+      from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/vision_bundle.mjs";
+
+    // ===================== Tunables (flip a sign if a control feels inverted) =====================
+    const STEER_SIGN  = 1;      // nose left/right -> steer. -1 to invert.
+    const PITCH_SIGN  = 1;      // nose down (duck / point down) -> accelerate. -1 to swap accel/brake.
+    const NOSE_IDX    = 4;      // MediaPipe FaceMesh nose-TIP landmark (4 = the protruding tip; 1 sits lower)
+    const NEUTRAL_X   = 0.5;    // neutral = CENTER OF FRAME/SCREEN, not wherever your nose happened to be
+    const NEUTRAL_Y   = 0.5;    // nose at center = 0 speed, straight ahead. C re-snaps it to your pose.
+    const HALF_X      = 0.15;   // nose x-offset (fraction of frame) mapped to full steer (bigger = less sensitive)
+    const HALF_Y      = 0.15;   // nose y-offset (fraction of frame) mapped to a full duck
+    const DEADZONE    = 0.012;  // as small as the tracker allows — small inputs must still count
+    const STEER_EXP   = 1.0;    // LINEAR: 1 = a small movement is worth exactly its size. Do not raise.
+
+    // Throttle: HOW FAR you duck sets the speed CEILING, and the bike ramps toward it
+    // procedurally. A small duck can only ever reach a small speed, no matter how long you
+    // hold it; VMAX needs a full duck. Head up = below the ceiling = brake, fully up = stop.
+    const START_SPEED = 0.0;    // start from a standstill
+    const VMAX        = 80.0;   // top speed, reached only at a FULL duck
+    const DUCK_GATE   = 0.04;   // how far below neutral starts to count as "ducked"
+    const THR_EXP     = 1.5;    // duck -> ceiling curve (>1 = the last part of the duck is the fast part)
+
+    // Rates are expressed as TIMES so they stay sensible whatever you set VMAX to.
+    const ACCEL_TIME  = 3.5;    // seconds from a standstill to VMAX at a full duck
+    const COAST_TIME  = 9.0;    // seconds to roll from VMAX down to a stop, head neutral
+    const BRAKE_TIME  = 2.0;    // seconds to haul it down from VMAX with the head fully up
+    const ACCEL_RATE  = VMAX / ACCEL_TIME;
+    const COAST_RATE  = VMAX / COAST_TIME;
+    const BRAKE_RATE  = VMAX / BRAKE_TIME;
+
+    // Easing = TIME CONSTANT in seconds, frame-rate independent (see smooth()).
+    // Kept as SMALL as possible: this is anti-jitter only, NOT feel. Raising any of these
+    // adds input lag — 0 would be raw (and jumpy, because detection arrives ~30x/sec).
+    const HEAD_TAU    = 0.035;  // raw head/key input -> control input (one video frame of filtering)
+    // Filter lag is HEAD_TAU + STEER_TAU ~= 65 ms, plus MediaPipe detection latency.
+    // Cascading more smoothing stages ADDS their time constants — do not add a third.
+
+    const STEER_TAU   = 0.02;   // control input -> steering. Kept tiny.
+
+    // Note: head deflection commands sideways SPEED, which is then integrated into position.
+    // Integration is itself a low-pass, which is why this stays stable on a noisy 30 Hz feed.
+    // Mapping head position straight onto road position was tried and is unusable: it
+    // DIFFERENTIATES the tracking noise. Snappiness comes from LAT_SPEED, never from
+    // stripping out the filters below.
+    // ARCADE STEERING (Traffic Racer): INFINITE GRIP. Head deflection commands sideways speed
+    // directly, and that sideways speed does NOT shrink as you go faster — a small input is
+    // worth exactly as much at 80 as at 20. There is no cornering-force budget, no understeer,
+    // no way to lose traction: you only ever lose by hitting something.
+    const LAT_SPEED   = 15.0;   // sideways speed at full head deflection (units/s). THE snappiness knob.
+    const LAT_VMIN    = 7.0;    // below this forward speed the sideways response fades in
+                                // (so a stopped bike does not skate sideways)
+
+    // Yaw and lean are pure BODY POSITIONING — cosmetic, read straight off the smooth steer
+    // input. They never limit or delay how fast the bike actually moves across the road.
+    const YAW_VIS     = 0.75;   // how much the bike points into its sideways travel
+    const YAW_MAX     = 0.30;   // cap on that visual yaw (rad)
+    const YAW_TAU     = 0.05;   // yaw easing (cosmetic)
+    const LEAN_MAX    = 0.62;   // max lean (rad ~36deg) at full head deflection
+    const LEAN_TAU    = 0.05;   // lean easing (cosmetic) — keep small or the lean lags your head
+    const LEAN_SIGN   = 1;      // -1 if lean tilts the wrong way
+
+    // First person: the camera is PARENTED to the bike's lean group (see initThree), so it
+    // inherits position, yaw and roll exactly — zero easing, it can never be outrun.
+    const FP_HEIGHT   = 1.25;   // rider eye height above the bike origin
+    const FP_FWD      = 0.25;   // eye offset forward of the bike origin
+    const FP_PITCH    = -0.035; // slight downward tilt so more road is visible (rad)
+    const FP_ROLL     = 1.0;    // 1 = full bike roll (true first person), 0 = level horizon
+
+    const DISP_RANGE_X = 0.22;  // nose x-offset (frac of frame) that reaches the screen edge
+    const DISP_RANGE_Y = 0.18;  // nose y-offset that reaches the screen edge
+    const DISP_EXP     = 1.5;   // reticle easing (>1 = less linear near the center)
+    const DISP_TAU     = 0.03;  // reticle glide — tracks the nose with no perceptible lag
+    const DISP_SPAN    = 46;    // percent from center to screen edge (matches screen size)
+
+    // ---- Endless highway ----
+    const ROAD_HALF   = 9.0;    // half width of the tarmac (3 lanes of 6)
+    const LANE_X      = [-6, 0, 6];
+    const SHOULDER    = 1.6;    // gravel strip outside the tarmac (draggy)
+    const RAIL_X      = ROAD_HALF + SHOULDER;   // hard guardrail
+    const SEG_LEN     = 60;     // length of one recycled road chunk
+    const NUM_SEG     = 16;     // chunks alive at once -> 960 units of road in front/behind
+    const OFFROAD_DRAG= 16.0;   // extra deceleration on the gravel (units/s^2)
+    const BIKE_R      = 0.55;   // bike collision radius
+
+    const OBST_SLOTS  = 3;      // obstacle "gates" per chunk
+    const DIFF_DIST   = 2500;   // metres over which difficulty ramps to full
+    const HIT_SLOW    = 0.35;   // fraction of speed kept after a hit
+    const HIT_COOLDOWN= 1.2;    // seconds of immunity after a hit
+    const REBASE_Z    = 4000;   // shift the world back toward the origin to keep floats happy
+    // =============================================================================================
+
+    const videoEl  = document.getElementById('webcam');
+    const statusEl = document.getElementById('status');
+    const hudEl    = document.getElementById('hud');
+    const scoreEl  = document.getElementById('score');
+    const flashEl  = document.getElementById('flash');
+    const reticleEl = document.getElementById('reticle');
+    const overlayCanvas = document.getElementById('overlay');
+    const overlayCtx = overlayCanvas.getContext('2d');
+    overlayCanvas.width = 240; overlayCanvas.height = 180;
+    const threeContainer = document.getElementById('three-canvas');
+
+    let scene, camera, renderer, groundTex, ground;
+    let bikeYaw, bikeLean;        // outer group (position+heading), inner group (lean)
+
+    function makeGridTexture() {
+      const c = document.createElement('canvas'); c.width = c.height = 256;
+      const x = c.getContext('2d');
+      x.fillStyle = '#0f2a17'; x.fillRect(0,0,256,256);
+      x.strokeStyle = '#1c4a2c'; x.lineWidth = 3; x.strokeRect(0,0,256,256);
+      x.beginPath(); x.moveTo(128,0); x.lineTo(128,256); x.moveTo(0,128); x.lineTo(256,128); x.stroke();
+      const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(120,120);
+      return t;   // 1200-unit plane / 120 repeats => one tile every 10 world units
+    }
+
+    // ---- Shared materials (every chunk reuses these) ----
+    const M = {};
+    function initMaterials() {
+      M.road    = new THREE.MeshStandardMaterial({ color:0x1b1f27, roughness:0.95 });
+      M.gravel  = new THREE.MeshStandardMaterial({ color:0x2b2a24, roughness:1.0 });
+      M.paint   = new THREE.MeshStandardMaterial({ color:0xf2f2f2, roughness:0.6 });
+      M.dash    = new THREE.MeshStandardMaterial({ color:0xffe14d, roughness:0.6 });
+      M.rail    = new THREE.MeshStandardMaterial({ color:0x9aa4b2, roughness:0.5, metalness:0.4 });
+      M.post    = new THREE.MeshStandardMaterial({ color:0x555f6b, roughness:0.8 });
+      M.lampPost= new THREE.MeshStandardMaterial({ color:0x3a4350, roughness:0.8 });
+      M.lamp    = new THREE.MeshStandardMaterial({ color:0xfff0b0, emissive:0xffd76a });
+      M.barrel  = new THREE.MeshStandardMaterial({ color:0xff7a1a, roughness:0.5, emissive:0x3a1500 });
+      M.crate   = new THREE.MeshStandardMaterial({ color:0x8a5a2b, roughness:0.85 });
+      M.carBody = new THREE.MeshStandardMaterial({ color:0xc0392b, roughness:0.45, metalness:0.25 });
+      M.carGlass= new THREE.MeshStandardMaterial({ color:0x11212e, roughness:0.25, metalness:0.5 });
+      M.cone    = new THREE.MeshStandardMaterial({ color:0xff4d2d, roughness:0.6, emissive:0x330a00 });
+    }
+
+    // One obstacle. Never rotated, so collision stays a cheap axis-aligned box test.
+    // userData: { hw, hl } = half width (x) / half length (z) of the footprint.
+    function makeObstacle(kind) {
+      const g = new THREE.Group();
+      if (kind === 0) {                                  // barrel
+        const b = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 1.1, 14), M.barrel);
+        b.position.y = 0.55; g.add(b);
+        const band = new THREE.Mesh(new THREE.CylinderGeometry(0.52, 0.52, 0.22, 14), M.paint);
+        band.position.y = 0.62; g.add(band);
+        g.userData = { hw: 0.5, hl: 0.5 };
+      } else if (kind === 1) {                           // crate stack
+        const c = new THREE.Mesh(new THREE.BoxGeometry(1.3, 1.3, 1.3), M.crate);
+        c.position.y = 0.65; g.add(c);
+        const c2 = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.9, 0.9), M.crate);
+        c2.position.set(0.1, 1.75, -0.1); g.add(c2);
+        g.userData = { hw: 0.65, hl: 0.65 };
+      } else if (kind === 2) {                           // stalled car
+        const body = new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.85, 4.2), M.carBody);
+        body.position.y = 0.65; g.add(body);
+        const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.65, 2.0), M.carGlass);
+        cabin.position.set(0, 1.35, 0.2); g.add(cabin);
+        for (const dx of [-0.95, 0.95]) for (const dz of [1.4, -1.4]) {
+          const w = new THREE.Mesh(new THREE.CylinderGeometry(0.33, 0.33, 0.2, 12), M.post);
+          w.rotation.z = Math.PI/2; w.position.set(dx, 0.33, dz); g.add(w);
+        }
+        g.userData = { hw: 0.95, hl: 2.1 };
+      } else {                                           // cone pair
+        for (const dx of [-0.5, 0.5]) {
+          const c = new THREE.Mesh(new THREE.ConeGeometry(0.32, 0.85, 10), M.cone);
+          c.position.set(dx, 0.42, 0); g.add(c);
+        }
+        g.userData = { hw: 0.8, hl: 0.35 };
+      }
+      return g;
+    }
+
+    // ---- Road chunks. A chunk covers z in [pos.z - SEG_LEN, pos.z]; the bike drives toward -Z. ----
+    const segments = [];
+
+    function buildChunk() {
+      const g = new THREE.Group();
+
+      const road = new THREE.Mesh(new THREE.PlaneGeometry(ROAD_HALF*2, SEG_LEN), M.road);
+      road.rotation.x = -Math.PI/2; road.position.set(0, 0.02, -SEG_LEN/2); g.add(road);
+
+      for (const s of [-1, 1]) {                        // shoulders, edge paint, guardrail
+        const sh = new THREE.Mesh(new THREE.PlaneGeometry(SHOULDER, SEG_LEN), M.gravel);
+        sh.rotation.x = -Math.PI/2;
+        sh.position.set(s*(ROAD_HALF + SHOULDER/2), 0.015, -SEG_LEN/2); g.add(sh);
+
+        const edge = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.03, SEG_LEN), M.paint);
+        edge.position.set(s*(ROAD_HALF - 0.3), 0.045, -SEG_LEN/2); g.add(edge);
+
+        const rail = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.4, SEG_LEN), M.rail);
+        rail.position.set(s*RAIL_X, 0.75, -SEG_LEN/2); g.add(rail);
+        for (let z = -3; z > -SEG_LEN; z -= 6) {
+          const post = new THREE.Mesh(new THREE.BoxGeometry(0.16, 1.0, 0.16), M.post);
+          post.position.set(s*RAIL_X, 0.5, z); g.add(post);
+        }
+      }
+
+      for (const bx of [-ROAD_HALF/3, ROAD_HALF/3]) {   // dashed lane separators
+        for (let z = -2; z > -SEG_LEN; z -= 8) {
+          const d = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.03, 4), M.dash);
+          d.position.set(bx, 0.045, z); g.add(d);
+        }
+      }
+
+      for (let i = 0; i < 2; i++) {                     // street lamps, alternating sides
+        const s = (i % 2 === 0) ? -1 : 1;
+        const zl = -i*(SEG_LEN/2) - 10;
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.16, 7, 8), M.lampPost);
+        pole.position.set(s*(RAIL_X + 1.6), 3.5, zl); g.add(pole);
+        const arm = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.14, 0.14), M.lampPost);
+        arm.position.set(s*(RAIL_X + 0.9), 6.9, zl); g.add(arm);
+        const bulb = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.18, 0.4), M.lamp);
+        bulb.position.set(s*(RAIL_X + 0.2), 6.8, zl); g.add(bulb);
+      }
+
+      // Obstacle pool: OBST_SLOTS gates, each gate can block up to 2 of the 3 lanes.
+      const obstacles = [];
+      for (let i = 0; i < OBST_SLOTS * 2; i++) {
+        const o = makeObstacle(i % 4);
+        o.visible = false; g.add(o); obstacles.push(o);
+      }
+
+      scene.add(g);
+      return { group: g, obstacles };
+    }
+
+    // Re-roll a chunk's obstacles. Never blocks all three lanes, so the road is always passable.
+    function respawnObstacles(seg) {
+      const diff = Math.min(1, distance / DIFF_DIST);          // 0 -> 1 as you get further out
+      let k = 0;
+      for (let slot = 0; slot < OBST_SLOTS; slot++) {
+        const slotZ = -(slot + 0.5) * (SEG_LEN / OBST_SLOTS) + (Math.random() - 0.5) * 8;
+        const roll = Math.random();
+        // early on: often an empty gate; later: 1-2 blocked lanes at every gate
+        const nBlocked = (roll < 0.3 * (1 - diff)) ? 0 : (roll < 0.75 - 0.2 * diff ? 1 : 2);
+        const lanes = [0, 1, 2].sort(() => Math.random() - 0.5).slice(0, nBlocked);
+        for (const lane of lanes) {
+          const o = seg.obstacles[k++];
+          if (!o) break;
+          o.visible = true;
+          o.position.set(LANE_X[lane] + (Math.random() - 0.5) * 1.6,
+                         0, slotZ + (Math.random() - 0.5) * 3);
+        }
+      }
+      for (; k < seg.obstacles.length; k++) seg.obstacles[k].visible = false;
+    }
+
+    function buildHighway() {
+      for (let i = 0; i < NUM_SEG; i++) {
+        const seg = buildChunk();
+        seg.group.position.z = SEG_LEN * (1 - i);   // chunk 0 sits just behind the start line
+        segments.push(seg);
+      }
+    }
+
+    function resetHighway() {
+      for (let i = 0; i < segments.length; i++) {
+        segments[i].group.position.z = SEG_LEN * (1 - i);
+        // keep the first stretch clear so you never start inside an obstacle
+        if (i < 2) segments[i].obstacles.forEach(o => { o.visible = false; });
+        else respawnObstacles(segments[i]);
+      }
+    }
+
+    // Recycle chunks that fell behind the rider to the far end of the road -> endless.
+    function recycleChunks() {
+      const span = NUM_SEG * SEG_LEN;
+      for (const seg of segments) {
+        if (seg.group.position.z - SEG_LEN > pz + 30) {
+          seg.group.position.z -= span;
+          respawnObstacles(seg);
+        }
+      }
+    }
+
+    function buildBike() {
+      bikeYaw  = new THREE.Group();   // heading + position
+      bikeLean = new THREE.Group();   // lean about forward axis
+      bikeYaw.add(bikeLean);
+      scene.add(bikeYaw);
+
+      const bodyMat  = new THREE.MeshStandardMaterial({ color:0xff6a3d, roughness:0.4, metalness:0.2 });
+      const darkMat  = new THREE.MeshStandardMaterial({ color:0x222831, roughness:0.6 });
+      const riderMat = new THREE.MeshStandardMaterial({ color:0x39d0ff, roughness:0.5, emissive:0x0a2233 });
+
+      const chassis = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.22, 1.25), bodyMat);
+      chassis.position.y = 0.42; bikeLean.add(chassis);
+
+      const tank = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.24, 0.5), bodyMat);
+      tank.position.set(0, 0.58, -0.15); bikeLean.add(tank);
+
+      // rider (hidden in first-person so we don't see our own head)
+      const rider = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.18, 0.72, 12), riderMat);
+      rider.position.set(0, 0.95, 0.1); rider.visible = false; bikeLean.add(rider);
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.15, 16, 12), riderMat);
+      head.position.set(0, 1.4, 0.02); head.visible = false; bikeLean.add(head);
+
+      // wheels (axle along X)
+      for (const dz of [0.55, -0.55]) {
+        const w = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.12, 20), darkMat);
+        w.rotation.z = Math.PI/2; w.position.set(0, 0.3, dz); bikeLean.add(w);
+      }
+      // forward marker
+      const nose = new THREE.Mesh(new THREE.ConeGeometry(0.12, 0.3, 12), riderMat);
+      nose.rotation.x = -Math.PI/2; nose.position.set(0, 0.42, -0.8); bikeLean.add(nose);
+
+      // headlight, so obstacles read early at speed
+      const beam = new THREE.SpotLight(0xfff4d6, 1.4, 110, 0.5, 0.6, 1.0);
+      beam.position.set(0, 1.0, -0.6);
+      beam.target.position.set(0, 0, -30);
+      bikeLean.add(beam); bikeLean.add(beam.target);
+    }
+
+    // ---- Bike state ----
+    let px = 0, pz = 0, heading = 0, speed = START_SPEED;
+    let steerInput = 0, throttleInput = 0, curSteer = 0, leanCur = 0;
+    let distance = 0, best = 0, hits = 0, hitTimer = 0;
+
+    function resetBike() {
+      px = 0; pz = 0; heading = 0;
+      speed = START_SPEED; curSteer = 0; leanCur = 0;
+      distance = 0; hits = 0; hitTimer = 0;
+      centerX = NEUTRAL_X; centerY = NEUTRAL_Y; calibrated = true;   // R also restores the center zero
+      resetHighway();
+    }
+
+    function initThree() {
+      scene = new THREE.Scene();
+      scene.fog = new THREE.Fog(0x0a0e16, 60, 340);   // reaches further: VMAX is high now
+
+      camera = new THREE.PerspectiveCamera(62, innerWidth/innerHeight, 0.1, 600);
+      renderer = new THREE.WebGLRenderer({ antialias:true });
+      renderer.setSize(innerWidth, innerHeight); renderer.setPixelRatio(devicePixelRatio);
+      renderer.setClearColor(0x0a0e16, 1);
+      threeContainer.appendChild(renderer.domElement);
+
+      initMaterials();
+
+      groundTex = makeGridTexture();
+      ground = new THREE.Mesh(new THREE.PlaneGeometry(1200, 1200),
+        new THREE.MeshStandardMaterial({ map: groundTex, roughness:1.0 }));
+      ground.rotation.x = -Math.PI/2; ground.position.y = 0; scene.add(ground);
+
+      buildHighway();
+      buildBike();
+
+      // TRUE first person: the camera is not placed each frame, it IS part of the bike.
+      // As a child of bikeLean it inherits the bike's position, yaw and roll in the same
+      // matrix update — no easing, no catch-up, so it cannot be outrun at any VMAX.
+      bikeLean.add(camera);
+      camera.position.set(0, FP_HEIGHT, -FP_FWD);   // local -Z is the bike's forward
+      camera.rotation.set(FP_PITCH, 0, 0);
+
+      scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+      const sun = new THREE.DirectionalLight(0xffffff, 0.9); sun.position.set(20, 40, 10); scene.add(sun);
+      const rim = new THREE.DirectionalLight(0x66aaff, 0.4); rim.position.set(-20, 10, -20); scene.add(rim);
+
+      addEventListener('resize', () => {
+        camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+      resetBike();
+    }
+
+    // ---- Keyboard fallback ----
+    const keys = {};
+    addEventListener('keydown', e => {
+      keys[e.key] = true;
+      if (e.key === 'r' || e.key === 'R') resetBike();
+      if (e.key === 'c' || e.key === 'C') calibrated = false;   // recenter neutral to current head pose
+      if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) e.preventDefault();
+    });
+    addEventListener('keyup', e => { keys[e.key] = false; });
+    function keyInputs() {
+      let s = 0, a = 0;
+      if (keys['ArrowLeft'])  s -= 1;
+      if (keys['ArrowRight']) s += 1;
+      if (keys['ArrowDown'])  a += 1;    // down = accelerate
+      if (keys['ArrowUp'])    a -= 1;    // up   = brake
+      return { s, a };
+    }
+
+    // ---- Collision: axis-aligned footprint vs bike circle (obstacles are never rotated) ----
+    function hitObstacle() {
+      if (hitTimer > 0) return null;
+      for (const seg of segments) {
+        if (Math.abs((seg.group.position.z - SEG_LEN/2) - pz) > SEG_LEN) continue;   // chunk far away
+        for (const o of seg.obstacles) {
+          if (!o.visible) continue;
+          const dz = (seg.group.position.z + o.position.z) - pz;
+          if (Math.abs(dz) > o.userData.hl + BIKE_R) continue;
+          if (Math.abs(o.position.x - px) < o.userData.hw + BIKE_R) return o;
+        }
+      }
+      return null;
+    }
+
+    function bump(msg) {
+      hits++; hitTimer = HIT_COOLDOWN;
+      speed *= HIT_SLOW;
+      flashEl.style.opacity = '1';
+      setTimeout(() => { flashEl.style.opacity = '0'; }, 130);
+      statusEl.textContent = msg;
+    }
+
+    // ---- Smoothing helper ----
+    // Exponential ease toward a target with a time constant (seconds), frame-rate independent.
+    // Every tau here is tiny on purpose: enough to absorb detection jitter, not enough to feel.
+    // There is no rate limiter anywhere — nothing caps how fast the bike may respond.
+    function smooth(cur, target, tau, dt) {
+      return cur + (target - cur) * (1 - Math.exp(-dt / Math.max(1e-4, tau)));
+    }
+
+    // ---- Main loop ----
+    let faceActive = false, lastT = performance.now();
+    let inSteer = 0, inThr = 0;                      // smoothed control input (jitter-free)
+    let retX = 0, retY = 0, retTX = 0, retTY = 0;   // reticle current + target (screen-space, -1..1)
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const now = performance.now(); const dt = Math.min(0.05, (now - lastT)/1000); lastT = now;
+
+      const kb = keyInputs();
+      const rawSteer = faceActive ? steerInput : kb.s;
+      const rawThr   = faceActive ? throttleInput : kb.a;
+      // Smooth the raw input (detection is steppy / keys are binary) -> smoother ride
+      inSteer = smooth(inSteer, rawSteer, HEAD_TAU, dt);
+      inThr   = smooth(inThr,   rawThr,   HEAD_TAU, dt);
+      const steer = inSteer, thr = inThr;
+
+      // Throttle: duck DEPTH is the speed ceiling. Deeper duck = higher ceiling, and the bike
+      // accelerates toward it rather than jumping to it. Lift back up and the ceiling drops,
+      // so the bike sheds speed down to it; fully up the ceiling is 0 and it brakes to a stop.
+      const duck = Math.max(0,  thr);     // 0..1 below neutral
+      const lift = Math.max(0, -thr);     // 0..1 above neutral
+      const ducked = duck > DUCK_GATE;
+      const duckAmt = ducked ? Math.pow((duck - DUCK_GATE) / (1 - DUCK_GATE), THR_EXP) : 0;
+      const ceiling = duckAmt * VMAX;
+      if (speed < ceiling) speed = Math.min(ceiling, speed + ACCEL_RATE * dt);
+      else                 speed = Math.max(ceiling, speed - COAST_RATE * dt);
+      if (lift > 0) speed = Math.max(0, speed - BRAKE_RATE * lift * dt);   // head up = real brake
+
+      // Gravel shoulders scrub speed off
+      const onGravel = Math.abs(px) > ROAD_HALF;
+      if (onGravel) speed -= OFFROAD_DRAG * dt;
+      speed = Math.max(0, Math.min(VMAX, speed));
+
+      // Head deflection IS sideways speed. Speed-independent, so the same head movement moves
+      // you the same distance across the road at 20 or at 80 — that is the infinite-grip,
+      // Traffic-Racer response. Integrating the input (rather than mapping position onto it)
+      // is also what keeps a noisy 30 Hz landmark feed from turning into jitter.
+      curSteer = smooth(curSteer, steer, STEER_TAU, dt);
+      const vLat = curSteer * LAT_SPEED * Math.min(1, speed / LAT_VMIN);
+
+      px += vLat * dt;
+      pz -= speed * dt;   // forward is always straight down the highway
+
+      // Guardrail = hard wall. Costs speed, but never grip — you are simply stopped from
+      // leaving the road, exactly like clipping the barrier in Traffic Racer.
+      if (Math.abs(px) > RAIL_X - BIKE_R) {
+        px = Math.sign(px) * (RAIL_X - BIKE_R);
+        if (speed > 3 && hitTimer <= 0) bump("Guardrail! Ease back toward the middle of the road.");
+      }
+
+      distance += speed * dt;
+      if (distance > best) best = distance;
+      hitTimer = Math.max(0, hitTimer - dt);
+
+      recycleChunks();
+      if (hitObstacle()) bump("Hit an obstacle — weave between the lanes to keep your speed.");
+
+      // Keep world coordinates near the origin however far you ride
+      if (pz < -REBASE_Z) {
+        pz += REBASE_Z;
+        for (const seg of segments) seg.group.position.z += REBASE_Z;
+      }
+
+      // Yaw: point the bike a little into its sideways travel. Cosmetic, and computed from
+      // the smooth steer input (never a derivative of the tracked point), so it cannot jitter.
+      const yawRaw = Math.atan2(vLat, Math.max(12, speed)) * YAW_VIS;
+      heading = smooth(heading, Math.max(-YAW_MAX, Math.min(YAW_MAX, yawRaw)), YAW_TAU, dt);
+
+      // Lean = BODY POSITIONING, straight off your head. Full head deflection = full lean,
+      // half = half. It mirrors you 1:1 and never feeds back into how the bike moves.
+      const leanTarget = LEAN_SIGN * curSteer * LEAN_MAX;
+      leanCur = smooth(leanCur, leanTarget, LEAN_TAU, dt);
+
+      // Apply to meshes. The camera is a CHILD of bikeLean, so it inherits every one of these
+      // transforms on the same frame — it is the bike's eyes, it cannot be outrun or lag.
+      bikeYaw.position.set(px, 0, pz);
+      bikeYaw.rotation.y = -heading;    // align local -Z with forward f
+      bikeLean.rotation.z = -leanCur;   // roll about forward axis (into the weave)
+      camera.rotation.set(FP_PITCH, 0, leanCur * (1 - FP_ROLL));   // FP_ROLL 1 = keep full bike roll
+
+      // Endless ground: follow the rider, slide the texture so it still looks fixed in the world
+      ground.position.set(px, 0, pz);
+      groundTex.offset.set(px/10, -pz/10);
+
+      hudEl.textContent =
+        `speed : ${speed.toFixed(1)}\n` +
+        `steer : ${curSteer.toFixed(2)}  lat ${vLat.toFixed(1)}\n` +
+        `duck  : ${duckAmt.toFixed(2)} -> max ${ceiling.toFixed(0)} ${ducked ? '▼' : (lift > 0.05 ? '▲ brake' : '· coast')}\n` +
+        `lean  : ${(leanCur*57.3).toFixed(0)}°\n` +
+        `surf  : ${onGravel ? 'GRAVEL' : 'road'}\n` +
+        `hits  : ${hits}\n` +
+        `input : ${faceActive ? 'HEAD' : 'keys'}`;
+
+      scoreEl.innerHTML = `${distance.toFixed(0)} m<small>best ${best.toFixed(0)} m · ${hits} hits</small>`;
+
+      // On-screen reticle = where the nose tip is, mapped across most of the screen with
+      // easing (non-linear) and glide so it doesn't snap linearly.
+      retX = smooth(retX, retTX, DISP_TAU, dt);
+      retY = smooth(retY, retTY, DISP_TAU, dt);
+      reticleEl.style.left = (50 + retX * DISP_SPAN) + '%';
+      reticleEl.style.top  = (50 + retY * DISP_SPAN) + '%';
+      reticleEl.style.opacity = faceActive ? '1' : '0.3';
+
+      renderer.render(scene, camera);
+    }
+
+    // ---- MediaPipe ----
+    let faceLandmarker, lastVideoTime = -1;
+    // Neutral reference = the CENTER of the frame/screen. It is NOT auto-snapped to your
+    // resting pose on the first frame any more — that is what dragged the zero point down
+    // to chin height. Sit so your nose is on the center ring: that is 0 speed, straight
+    // ahead. Press C only if you deliberately want to re-zero on your current pose.
+    let calibrated = true, centerX = NEUTRAL_X, centerY = NEUTRAL_Y;
+
+    async function initFace() {
+      const resolver = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/wasm");
+      faceLandmarker = await FaceLandmarker.createFromOptions(resolver, {
+        baseOptions: { modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          delegate: "GPU" },
+        runningMode: "VIDEO", numFaces: 1
+      });
+    }
+    async function startCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width:640, height:480, facingMode:"user" }, audio:false });
+      videoEl.srcObject = stream;
+      await new Promise(r => (videoEl.onloadedmetadata = r)); await videoEl.play();
+    }
+
+    // deadzone, normalize to [-1,1], then optionally curve it (exp > 1 = gentle near center)
+    function toAxis(off, half, exp) {
+      if (Math.abs(off) < DEADZONE) return 0;
+      const v = (off - Math.sign(off) * DEADZONE) / half;
+      const n = Math.max(-1, Math.min(1, v));
+      return exp ? Math.sign(n) * Math.pow(Math.abs(n), exp) : n;
+    }
+
+    // Draw the nose-tip reference marker on the PiP preview (canvas is CSS-mirrored to match video)
+    function drawMarker(f) {
+      const W = overlayCanvas.width, H = overlayCanvas.height;
+      overlayCtx.clearRect(0, 0, W, H);
+      // neutral reference ring
+      overlayCtx.strokeStyle = 'rgba(255,255,255,0.7)'; overlayCtx.lineWidth = 1.5;
+      overlayCtx.beginPath(); overlayCtx.arc(centerX*W, centerY*H, 6, 0, Math.PI*2); overlayCtx.stroke();
+      // link line
+      overlayCtx.strokeStyle = 'rgba(143,255,207,0.5)';
+      overlayCtx.beginPath(); overlayCtx.moveTo(centerX*W, centerY*H); overlayCtx.lineTo(f.x*W, f.y*H); overlayCtx.stroke();
+      // nose-tip point
+      const mx = f.x*W, my = f.y*H;
+      overlayCtx.fillStyle = '#8fffcf'; overlayCtx.strokeStyle = '#0a0e16'; overlayCtx.lineWidth = 2;
+      overlayCtx.beginPath(); overlayCtx.arc(mx, my, 7, 0, Math.PI*2); overlayCtx.fill(); overlayCtx.stroke();
+      overlayCtx.strokeStyle = '#8fffcf'; overlayCtx.lineWidth = 1.5;
+      overlayCtx.beginPath();
+      overlayCtx.moveTo(mx-13, my); overlayCtx.lineTo(mx+13, my);
+      overlayCtx.moveTo(mx, my-13); overlayCtx.lineTo(mx, my+13);
+      overlayCtx.stroke();
+    }
+
+    function faceLoop() {
+      if (faceLandmarker && videoEl.currentTime !== lastVideoTime && videoEl.readyState >= 2) {
+        lastVideoTime = videoEl.currentTime;
+        const res = faceLandmarker.detectForVideo(videoEl, performance.now());
+        if (res.faceLandmarks && res.faceLandmarks.length) {
+          const f = res.faceLandmarks[0][NOSE_IDX];   // nose-tip reference point
+          if (!calibrated) { centerX = f.x; centerY = f.y; calibrated = true; }
+          faceActive = true;
+          // Raw frame is not mirrored: moving head RIGHT lowers f.x -> invert x for intuitive steering
+          steerInput    = STEER_SIGN * toAxis(centerX - f.x, HALF_X, STEER_EXP);
+          throttleInput = PITCH_SIGN * toAxis(f.y - centerY, HALF_Y);
+          // Reticle target: nose offset mapped wide + eased (matches screen, non-linear)
+          const ease = (v, r) => { const n = Math.max(-1, Math.min(1, v / r));
+            return Math.sign(n) * Math.pow(Math.abs(n), DISP_EXP); };
+          retTX = ease(centerX - f.x, DISP_RANGE_X);
+          retTY = ease(f.y - centerY, DISP_RANGE_Y);
+          drawMarker(f);
+          if (hitTimer <= 0) statusEl.textContent =
+            "Nose ✔  Nose ON the center ring = 0 speed • below center = accelerate • above = brake • L/R = weave • C = re-zero on your pose • R = restart.";
+        } else {
+          faceActive = false;
+          retTX = 0; retTY = 0;
+          overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+          statusEl.textContent = "No face — center your face in the preview. (Arrow keys also work.)";
+        }
+      }
+      requestAnimationFrame(faceLoop);
+    }
+
+    // ---- Boot ----
+    (async function main() {
+      try {
+        initThree(); animate();
+        statusEl.textContent = "Requesting webcam…";
+        await startCamera();
+        statusEl.textContent = "Loading face model…";
+        await initFace();
+        statusEl.textContent = "Ready! Sit so your nose sits on the CENTER ring = 0 speed. Duck below center to build speed, head up to brake, L/R to weave. C = re-zero • R = restart.";
+        faceLoop();
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = "Camera/model error: " + err.message + "  — You can still ride with Arrow keys. R = restart.";
+      }
+    })();
+  </script>
+</body>
+</html>
